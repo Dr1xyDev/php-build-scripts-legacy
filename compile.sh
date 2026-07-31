@@ -259,11 +259,21 @@ elif [[ "$COMPILE_TARGET" == "linux" ]] || [[ "$COMPILE_TARGET" == "linux32" ]];
 	GMP_ABI="32"
 	echo "[INFO] Compiling for Linux x86"
 elif [ "$COMPILE_TARGET" == "linux64" ]; then
-	[ -z "$march" ] && march=x86-64;
-	[ -z "$mtune" ] && mtune=nocona;
-	CFLAGS="$CFLAGS -m64"
-	GMP_ABI="64"
-	echo "[INFO] Compiling for Linux x86_64"
+	_HOST_ARCH=$(uname -m)
+	if [ "$_HOST_ARCH" == "aarch64" ]; then
+		# Compiling for Linux aarch64 (Cobalt 100 / ARM64 native runner)
+		[ -z "$march" ] && march=armv8-a;
+		[ -z "$mtune" ] && mtune=generic;
+		# Do NOT add -m64 or -march=x86-64 — those flags are invalid on aarch64 and cause ICE
+		GMP_ABI="64"
+		echo "[INFO] Compiling for Linux aarch64 (ARM64 — Cobalt 100)"
+	else
+		[ -z "$march" ] && march=x86-64;
+		[ -z "$mtune" ] && mtune=nocona;
+		CFLAGS="$CFLAGS -m64"
+		GMP_ABI="64"
+		echo "[INFO] Compiling for Linux x86_64"
+	fi
 elif [ "$COMPILE_TARGET" == "rpi" ]; then
 	[ -z "$march" ] && march=armv6zk;
 	[ -z "$mtune" ] && mtune=arm1176jzf-s;
