@@ -1,0 +1,460 @@
+name: Build PHP 7.0.x Linux ARM64 + test + backup
+
+on:
+  push:
+    branches: "**"
+    tags-ignore: "**"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Compile PHP 7.0.x Linux ARM64 (Cobalt 100)
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make autoconf automake libtool libtool-bin m4 wget libc-bin gzip bzip2 bison g++ git re2c
+
+      - name: Verify ARM64 architecture
+        run: |
+          echo "=== Architecture check ==="
+          uname -m
+          file /bin/bash
+          echo "=== Expected: aarch64 ==="
+
+      - name: Verify compile.sh has ARM64 patch
+        run: |
+          echo "=== Checking ARM64 patch in compile.sh ==="
+          if grep -q 'Compiling for Linux aarch64' ./compile.sh; then
+            echo "OK: compile.sh has the ARM64 patch."
+          else
+            echo "ERROR: compile.sh does NOT have the ARM64 patch!"
+            echo "The original compile.sh forces -m64 and -march=x86-64 which are INVALID on aarch64."
+            exit 1
+          fi
+
+      - name: Prepare download cache
+        id: download-cache
+        uses: actions/cache@v4
+        with:
+          path: ./download_cache
+          key: php7-legacy-arm64-${{ hashFiles('./compile.sh') }}
+          restore-keys: php7-legacy-arm64-
+
+      - name: Compile PHP 7.0.x
+        run: |
+          chmod +x ./compile.sh
+          set -ex
+          trap "exit 1" ERR
+          # -t linux64  : target (patched to detect aarch64 at runtime)
+          # -j 4        : parallel make threads
+          # -P 4        : PocketMine API 4 (PHP 7 era)
+          # NOTE: legacy compile.sh does not have -z (PHP version flag) or -P flags.
+          #       PHP version is controlled by PHP_VERSION env var (default: 7.0.6).
+          #       Override here to match your desired version.
+          PHP_VERSION="${PHP_VERSION:-7.0.6}" ./compile.sh -t linux64 -j 4
+
+      - name: Verify compiled binary is ARM64
+        run: |
+          echo "=== Compiled PHP binary architecture ==="
+          file bin/php7/bin/php
+          echo "=== Expected: ELF 64-bit LSB ... ARM aarch64 ==="
+          bin/php7/bin/php --version
+
+      - name: Resolve symlinks in bin/ to real files
+        run: |
+          echo "=== Resolving symlinks in bin/ to regular files ==="
+          echo "=== (prevents broken .so files after GitHub artifact zip roundtrip) ==="
+          find bin/ -type l | while read -r LINK; do
+            TARGET=$(readlink -f "$LINK")
+            if [ -n "$TARGET" ] && [ -f "$TARGET" ]; then
+              echo "  Resolving: $LINK -> $TARGET"
+              rm -f "$LINK"
+              cp -a "$TARGET" "$LINK"
+              chmod +x "$LINK" 2>/dev/null || true
+            fi
+          done
+          echo "=== Symlinks resolved. All .so are now real files. ==="
+          # Double-check: no more symlinks inside bin/
+          REMAINING=$(find bin/ -type l | wc -l)
+          echo "Remaining symlinks: $REMAINING (should be 0)"
+
+      - name: Create tarball
+        run: |
+          tar -czpf ./PHP-7.0.x-Linux-ARM64-PM4.tar.gz bin
+          echo "=== Tarball contents (top level) ==="
+          tar -tzf ./PHP-7.0.x-Linux-ARM64-PM4.tar.gz | head -20
+          ls -lh ./PHP-7.0.x-Linux-ARM64-PM4.tar.gz
+
+      - name: Upload PHP binary artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: PHP-7.0.x-Linux-ARM64-PM4
+          path: |
+            ./PHP-7.0.x-Linux-ARM64-PM4.tar.gz
+            install.log
+            compile.sh
+          if-no-files-found: error
+
+      - name: Prepare workspace for upload on failure
+        if: failure()
+        run: tar -czf workspace.tar.gz install_data || true
+
+      - name: Upload workspace on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: PHP-7.0.x-Linux-ARM64-workspace
+          path: workspace.tar.gz
+          if-no-files-found: warn
+
+  test-and-backup:
+    name: Test binary + build server backup
+    needs: build-linux
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl unzip tar
+
+      - name: Download Linux PHP artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PHP-7.0.x-Linux-ARM64-PM4
+          path: ${{ github.workspace }}/php-bin
+
+      - name: Extract PHP binary
+        run: |
+          cd ${{ github.workspace }}/php-bin
+          ls -la
+          tar -xzpf ./PHP-7.0.x-Linux-ARM64-PM4.tar.gz -C ${{ github.workspace }}
+          ls -la ${{ github.workspace }}/bin/php7/bin/
+          chmod +x ${{ github.workspace }}/bin/php7/bin/php
+          find ${{ github.workspace }}/bin -type f -name "*.so*" -exec chmod +x {} \; 2>/dev/null || true
+          echo "=== Verify binary architecture ==="
+          file ${{ github.workspace }}/bin/php7/bin/php
+          echo "=== PHP version ==="
+          ${{ github.workspace }}/bin/php7/bin/php --version
+          echo "=== Check no broken symlinks ==="
+          BROKEN=$(find ${{ github.workspace }}/bin -xtype l | wc -l)
+          echo "Broken symlinks: $BROKEN (should be 0 — resolved in build step)"
+
+      - name: Download PocketMine-MP.phar from MediaFire
+        run: |
+          mkdir -p ${{ github.workspace }}/server
+          cd ${{ github.workspace }}/server
+          wget -q --tries=3 --timeout=30 \
+            "https://www.mediafire.com/file/v8he69aaxzkhpe7/PocketMine-MP.phar/file" \
+            -O mediafire_page.html || true
+          DIRECT_URL=$(grep -oP 'https://download[0-9]+\.mediafire\.com/[^"'"'"']+\.phar' \
+            mediafire_page.html | head -1 || true)
+          if [ -z "$DIRECT_URL" ]; then
+            echo "Direct URL not found — trying aria2c..."
+            sudo apt-get install -y aria2 2>/dev/null || true
+            aria2c --max-tries=3 --timeout=30 \
+              -o PocketMine-MP.phar \
+              "https://www.mediafire.com/file/v8he69aaxzkhpe7/PocketMine-MP.phar/file" || true
+          else
+            echo "Found direct URL: $DIRECT_URL"
+            wget -q --tries=3 --timeout=60 "$DIRECT_URL" -O PocketMine-MP.phar
+          fi
+          ls -la PocketMine-MP.phar
+          file PocketMine-MP.phar
+
+      - name: Setup server files
+        run: |
+          cd ${{ github.workspace }}/server
+          if [ ! -f server.properties ]; then
+            cat > server.properties << 'PROPS'
+          motd=DreamWix PHP7 Test Server
+          server-port=19132
+          whitelist=off
+          announce-player-achievements=on
+          spawn-protection=16
+          max-players=20
+          allow-flight=off
+          white-list=off
+          server-ip=
+          level-name=world
+          level-seed=
+          level-type=DEFAULT
+          force-gamemode=off
+          gamemode=0
+          difficulty=1
+          online-mode=off
+          view-distance=8
+          allow-nether=on
+          spawn-animals=on
+          spawn-mobs=on
+          pvp=on
+          enable-query=on
+          enable-rcon=off
+          auto-save=on
+          PROPS
+          fi
+          if [ ! -f pocketmine.yml ]; then
+            cat > pocketmine.yml << 'YML'
+          settings:
+            force-language: false
+            shutdown-message: "Server closed"
+            query-plugins: true
+            deprecated-verbose: true
+            async-workers: auto
+            memory-limit: 256M
+          YML
+          fi
+          mkdir -p plugins worlds
+          ls -la
+
+      - name: Boot server and keep running for 2 minutes
+        run: |
+          cd ${{ github.workspace }}/server
+
+          chmod +x ${{ github.workspace }}/bin/php7/bin/php
+          find ${{ github.workspace }}/bin -type f -name "*.so*" -exec chmod +x {} \; 2>/dev/null || true
+
+          # Write start.sh using bin/ relative path (same layout as production)
+          cat > start.sh << 'STARTSH'
+          #!/bin/sh
+          chmod +x ./bin/php7/bin/php
+          ./bin/php7/bin/php ./PocketMine-MP.phar --no-wizard
+          STARTSH
+          chmod +x start.sh
+
+          # Symlink bin/ into server/ so start.sh finds it via relative path
+          if [ ! -d ./bin ]; then
+            cp -a ${{ github.workspace }}/bin ./bin
+            chmod +x ./bin/php7/bin/php
+          fi
+
+          echo "=== Verifying PHP works ==="
+          ./bin/php7/bin/php --version
+          echo "---"
+
+          # --disable-ansi for cleaner CI logs
+          sed -i 's|--no-wizard|--no-wizard --disable-ansi|' start.sh
+          cat start.sh
+          echo "---"
+
+          echo "=== Booting server ==="
+          nohup ./start.sh > server.log 2>&1 &
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
+
+          # Phase 1: Wait for boot (up to 180s)
+          echo "=== Phase 1: Waiting for boot (up to 180s) ==="
+          BOOT_OK=0
+          for i in $(seq 1 180); do
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "Server process died before finishing boot at second $i."
+              break
+            fi
+            if grep -qiE 'Done \(.*\)!|Done \(' server.log 2>/dev/null; then
+              echo "Server finished booting at second $i."
+              BOOT_OK=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$BOOT_OK" -ne 1 ]; then
+            echo "Server did not finish booting within 180s."
+            kill -TERM $SERVER_PID 2>/dev/null || true
+            sleep 3
+            kill -KILL $SERVER_PID 2>/dev/null || true
+            echo "--- Server log ---"
+            cat server.log
+            echo "--- End of log ---"
+            exit 0
+          fi
+
+          # Phase 2: Let it run for 2 minutes to generate world data
+          echo "=== Phase 2: Running for 120s to generate world data ==="
+          for i in $(seq 1 120); do
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "Server died at second $i of phase 2."
+              break
+            fi
+            sleep 1
+          done
+
+          # Phase 3: Graceful stop
+          echo "=== Phase 3: Stopping server ==="
+          if kill -0 $SERVER_PID 2>/dev/null; then
+            kill -TERM $SERVER_PID || true
+            sleep 5
+            if kill -0 $SERVER_PID 2>/dev/null; then
+              echo "SIGTERM ignored — sending SIGKILL."
+              kill -KILL $SERVER_PID 2>/dev/null || true
+            fi
+          fi
+
+          echo "--- Server log (tail 200) ---"
+          tail -n 200 server.log
+          echo "--- End of log ---"
+
+          echo "=== Generated files ==="
+          ls -la
+          find . -maxdepth 3 -type f -printf '%y %m %p\n' | head -80
+
+      - name: Build ready-to-run server backup
+        if: always()
+        run: |
+          set -x
+
+          STAGE="${{ github.workspace }}/stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+
+          # 1) PHP binary tree — symlinks already resolved in build step,
+          #    so no zip/extract roundtrip will produce 0-byte .so files.
+          if [ -d ${{ github.workspace }}/bin ]; then
+            cp -a ${{ github.workspace }}/bin "$STAGE/bin"
+            chmod +x "$STAGE/bin/php7/bin/php" 2>/dev/null || true
+            find "$STAGE/bin" -type f -name "*.so*" -exec chmod +x {} \; 2>/dev/null || true
+            find "$STAGE/bin" -type f -path "*/bin/*" -exec chmod +x {} \; 2>/dev/null || true
+
+            # Safety net: resolve any remaining symlinks (should be none after build step)
+            echo "=== Safety-net: resolve any lingering symlinks in bin/ ==="
+            find "$STAGE/bin" -type l | while read -r LINK; do
+              TARGET=$(readlink -f "$LINK")
+              if [ -n "$TARGET" ] && [ -f "$TARGET" ]; then
+                rm -f "$LINK"
+                cp -a "$TARGET" "$LINK"
+                chmod +x "$LINK" 2>/dev/null || true
+              fi
+            done
+            REMAINING=$(find "$STAGE/bin" -type l | wc -l)
+            echo "Remaining symlinks after safety-net: $REMAINING"
+          fi
+
+          # 2) PocketMine-MP.phar
+          if [ -f ${{ github.workspace }}/server/PocketMine-MP.phar ]; then
+            cp -a ${{ github.workspace }}/server/PocketMine-MP.phar "$STAGE/PocketMine-MP.phar"
+          fi
+
+          # 3) start.sh for production use
+          cat > "$STAGE/start.sh" << 'STARTSH'
+          #!/bin/sh
+          chmod +x ./bin/php7/bin/php
+          ./bin/php7/bin/php ./PocketMine-MP.phar --no-wizard
+          STARTSH
+          chmod +x "$STAGE/start.sh"
+
+          # 4) Server configs
+          for f in server.properties pocketmine.yml ops.txt whitelist.txt banned-players.txt banned-ips.txt; do
+            if [ -f ${{ github.workspace }}/server/$f ]; then
+              cp -a ${{ github.workspace }}/server/$f "$STAGE/$f"
+            fi
+          done
+
+          # 5) Worlds
+          if [ -d ${{ github.workspace }}/server/worlds ]; then
+            cp -a ${{ github.workspace }}/server/worlds "$STAGE/worlds"
+          fi
+          for w in world nether ender; do
+            if [ -d ${{ github.workspace }}/server/$w ]; then
+              cp -a ${{ github.workspace }}/server/$w "$STAGE/$w"
+            fi
+          done
+
+          # 6) Plugins + plugin_data
+          if [ -d ${{ github.workspace }}/server/plugins ]; then
+            cp -a ${{ github.workspace }}/server/plugins "$STAGE/plugins"
+          fi
+          if [ -d ${{ github.workspace }}/server/plugin_data ]; then
+            cp -a ${{ github.workspace }}/server/plugin_data "$STAGE/plugin_data"
+          fi
+
+          # 7) Crashdumps
+          if [ -d ${{ github.workspace }}/server/crashdumps ]; then
+            cp -a ${{ github.workspace }}/server/crashdumps "$STAGE/crashdumps"
+          fi
+
+          # 8) Server log
+          if [ -f ${{ github.workspace }}/server/server.log ]; then
+            cp -a ${{ github.workspace }}/server/server.log "$STAGE/server.log"
+          fi
+
+          # 9) Traceability
+          if [ -f ${{ github.workspace }}/php-bin/install.log ]; then
+            cp -a ${{ github.workspace }}/php-bin/install.log "$STAGE/install.log"
+          fi
+          if [ -f ${{ github.workspace }}/php-bin/compile.sh ]; then
+            cp -a ${{ github.workspace }}/php-bin/compile.sh "$STAGE/compile.sh"
+          fi
+
+          echo "=== Backup top-level layout ==="
+          ls -la "$STAGE"
+          du -sh "$STAGE"
+
+          cat > "$STAGE/README.txt" << 'README'
+          DreamWix / Aquamarine — PHP 7.0.x Linux ARM64 server backup
+          =============================================================
+          Target: Cobalt 100 (ARM64 aarch64) — ubuntu-22.04-arm runner
+
+          Contents:
+            bin/                  PHP 7.0.x binary tree (all .so are real files — no symlinks)
+            PocketMine-MP.phar    PocketMine phar
+            start.sh              Boot script
+            server.properties     server config
+            pocketmine.yml        pocketmine config
+            worlds/               generated worlds (2-min test boot)
+            plugins/              plugins folder
+            plugin_data/          plugin data (if any)
+            server.log            boot log from CI test
+            crashdumps/           crashdumps (if any)
+            install.log           PHP compile log
+            compile.sh            compile script used
+
+          HOW TO RUN (Cobalt 100 / any Linux aarch64):
+          ---------------------------------------------
+            mkdir -p /opt/server && cd /opt/server
+            tar -xzpf server-backup-*.tar.gz
+            ./start.sh
+
+          NOTE: All .so files are real copies (not symlinks). This is intentional —
+          GitHub Actions upload-artifact uses zip internally which doesn't preserve
+          symlinks reliably. Using real copies prevents the "file too short" error
+          that happens when libyaml or libssl symlinks become 0-byte files.
+          README
+
+          # Pack with -p to preserve permissions, strip ./ prefix
+          cd ${{ github.workspace }}
+          tar -czpf server-backup-PHP7-Linux-ARM64.tar.gz -C "$STAGE" --transform 's|^\./||' .
+          ls -lh server-backup-PHP7-Linux-ARM64.tar.gz
+
+          echo "=== tar.gz top-level contents ==="
+          tar -tzf server-backup-PHP7-Linux-ARM64.tar.gz | head -20
+
+      - name: Upload server backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ServerBackup-PHP7-Linux-ARM64
+          path: ${{ github.workspace }}/server-backup-PHP7-Linux-ARM64.tar.gz
+          if-no-files-found: warn
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ServerLog-PHP7-Linux-ARM64
+          path: ${{ github.workspace }}/server/server.log
+          if-no-files-found: warn
