@@ -502,14 +502,24 @@ export ac_cv_func_realloc_0_nonnull=yes
 
 #mcrypt
 echo -n "[mcrypt] downloading $LIBMCRYPT_VERSION..."
-download_file "http://sourceforge.net/projects/mcrypt/files/Libmcrypt/$LIBMCRYPT_VERSION/libmcrypt-$LIBMCRYPT_VERSION.tar.gz" | tar -zx >> "$DIR/install.log" 2>&1
+# Mirror directo de SourceForge (más estable que el redirect genérico)
+download_file "https://downloads.sourceforge.net/project/mcrypt/Libmcrypt/$LIBMCRYPT_VERSION/libmcrypt-$LIBMCRYPT_VERSION.tar.gz" | tar -zx >> "$DIR/install.log" 2>&1
 mv libmcrypt-$LIBMCRYPT_VERSION libmcrypt
 echo -n " checking..."
 cd libmcrypt
+# Usar URLs raw de GitHub en lugar de gitweb CGI (las URLs gitweb devuelven HTML en runners modernos)
 rm -f config.guess
-download_file "http://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD" > config.guess
+download_file "https://raw.githubusercontent.com/gcc-mirror/gcc/master/config.guess" > config.guess
+if ! grep -q "^#" config.guess 2>/dev/null; then
+    download_file "https://git.savannah.gnu.org/cgit/config.git/plain/config.guess" > config.guess
+fi
+chmod +x config.guess
 rm -f config.sub
-download_file "http://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.sub;hb=HEAD" > config.sub
+download_file "https://raw.githubusercontent.com/gcc-mirror/gcc/master/config.sub" > config.sub
+if ! grep -q "^#" config.sub 2>/dev/null; then
+    download_file "https://git.savannah.gnu.org/cgit/config.git/plain/config.sub" > config.sub
+fi
+chmod +x config.sub
 RANLIB=$RANLIB ./configure --prefix="$DIR/bin/php7" \
 --disable-posix-threads \
 --enable-static \
